@@ -1,0 +1,312 @@
+--- a/src/plugins/coreplugin/modemanager.cpp	2026-10-12 13:04:53.526226513 +0000
++++ b/src/plugins/coreplugin/modemanager.cpp	2026-10-12 13:06:35.927187838 +0000
+@@ -390,9 +390,9 @@
+     const Id actionId = mode->id().withPrefix("QtCreator.Mode.");
+     QAction *action = new QAction(Tr::tr("Switch to <b>%1</b> mode").arg(mode->displayName()), m_instance);
+     Command *cmd = ActionManager::registerAction(action, actionId);
+-    cmd->setDefaultKeySequence(QKeySequence(
+-        useMacShortcuts ? QString("Meta+%1").arg(originalIndex + 1)
+-                        : QString("Ctrl+%1").arg(originalIndex + 1)));
++    // No default shortcut: Ctrl+<number> is used for numbered bookmarks.
++    // A shortcut can still be assigned in Preferences > Environment > Keyboard.
++    Q_UNUSED(originalIndex)
+     m_modeCommands.append(cmd);
+ 
+     m_modeStack->setTabToolTip(index, cmd->action()->toolTip());
+--- a/src/plugins/texteditor/bookmark.cpp	2026-10-12 13:04:53.526104449 +0000
++++ b/src/plugins/texteditor/bookmark.cpp	2026-10-12 13:06:53.844507011 +0000
+@@ -9,6 +9,11 @@
+ 
+ #include <utils/utilsicons.h>
+ 
++#include <QFontMetricsF>
++#include <QHash>
++#include <QIcon>
++#include <QPainter>
++#include <QPainterPath>
+ #include <QTextBlock>
+ 
+ using namespace Utils;
+@@ -17,6 +22,42 @@
+ 
+ const char BOOKMARKS_TEXT_MARK_CATEGORY[] = "Bookmarks.TextMarkCategory";
+ 
++// The bookmark icon with the bookmark's number drawn on top of it
++static QIcon numberedBookmarkIcon(int number)
++{
++    static QHash<int, QIcon> cache;
++    const auto it = cache.constFind(number);
++    if (it != cache.constEnd())
++        return *it;
++
++    const QIcon base = Icons::BOOKMARK_TEXTEDITOR.icon();
++    const QString text = QString::number(number);
++    QIcon result;
++    for (const int size : {16, 24, 32, 48, 64}) {
++        QPixmap pixmap = base.pixmap(QSize(size, size), 1.0);
++        if (pixmap.isNull()) {
++            pixmap = QPixmap(size, size);
++            pixmap.fill(Qt::transparent);
++        }
++        const QRectF rect = pixmap.rect();
++        QPainter painter(&pixmap);
++        painter.setRenderHint(QPainter::Antialiasing);
++        QFont font = painter.font();
++        font.setBold(true);
++        font.setPixelSize(qMax(8, int(rect.height() * 0.8)));
++        const QRectF textRect = QFontMetricsF(font).tightBoundingRect(text);
++        QPainterPath path;
++        path.addText(rect.center() - textRect.center(), font, text);
++        painter.strokePath(path, QPen(QColor(0, 0, 0, 200), qMax(1.5, rect.height() / 8.0),
++                                      Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
++        painter.fillPath(path, Qt::white);
++        painter.end();
++        result.addPixmap(pixmap);
++    }
++    cache.insert(number, result);
++    return result;
++}
++
+ Bookmark::Bookmark(int lineNumber, BookmarkManager *manager) :
+     TextMark(FilePath(), lineNumber, {Tr::tr("Bookmark"), BOOKMARKS_TEXT_MARK_CATEGORY}),
+     m_manager(manager)
+@@ -77,8 +118,35 @@
+ 
+ void Bookmark::setNote(const QString &note)
+ {
+-    setToolTip(note);
+-    setLineAnnotation(note);
++    m_note = note;
++    updateDisplay();
++}
++
++int Bookmark::number() const
++{
++    return m_number;
++}
++
++void Bookmark::setNumber(int number)
++{
++    if (m_number == number)
++        return;
++    m_number = number;
++    setIcon(m_number >= 0 ? numberedBookmarkIcon(m_number) : Icons::BOOKMARK_TEXTEDITOR.icon());
++    updateDisplay();
++}
++
++void Bookmark::updateDisplay()
++{
++    if (m_number < 0) {
++        setToolTip(m_note);
++        setLineAnnotation(m_note);
++    } else {
++        const QString prefix = QString("[%1]").arg(m_number);
++        setToolTip(m_note.isEmpty() ? Tr::tr("Bookmark %1").arg(m_number)
++                                    : Tr::tr("Bookmark %1: %2").arg(m_number).arg(m_note));
++        setLineAnnotation(m_note.isEmpty() ? prefix : prefix + QLatin1Char(' ') + m_note);
++    }
+     updateMarker();
+ }
+ 
+@@ -95,7 +163,7 @@
+ 
+ QString Bookmark::note() const
+ {
+-    return toolTip();
++    return m_note;
+ }
+ 
+ } // Bookmarks::Internal
+--- a/src/plugins/texteditor/bookmark.h	2026-10-12 13:04:53.526145693 +0000
++++ b/src/plugins/texteditor/bookmark.h	2026-10-12 13:06:35.925540169 +0000
+@@ -29,9 +29,17 @@
+     QString lineText() const;
+     QString note() const;
+ 
++    // Numbered bookmarks (1..9), -1 if the bookmark has no number
++    int number() const;
++    void setNumber(int number);
++
+ private:
++    void updateDisplay();
++
+     BookmarkManager *m_manager;
+     QString m_lineText;
++    QString m_note;
++    int m_number = -1;
+ };
+ 
+ } // TextEditor::Internal
+--- a/src/plugins/texteditor/bookmarkmanager.cpp	2026-10-12 13:04:53.526157091 +0000
++++ b/src/plugins/texteditor/bookmarkmanager.cpp	2026-10-12 13:06:53.845049525 +0000
+@@ -423,6 +423,41 @@
+     docNextAction.bindContextAction(&m_docNextAction);
+     docNextAction.addOnTriggered(this, [this] { nextInDocument(); });
+ 
++    bookmarkMenu.addSeparator();
++
++    // Numbered bookmarks: Ctrl+Shift+N sets, Ctrl+N jumps (N = 1..9)
++    const Id setNumberedMenuId = "Bookmarks.Menu.SetNumbered";
++    MenuBuilder setNumberedMenu(setNumberedMenuId);
++    setNumberedMenu.setTitle(Tr::tr("Set Numbered Bookmark"));
++    setNumberedMenu.addToContainer(bookmarkMenuId);
++
++    const Id gotoNumberedMenuId = "Bookmarks.Menu.GotoNumbered";
++    MenuBuilder gotoNumberedMenu(gotoNumberedMenuId);
++    gotoNumberedMenu.setTitle(Tr::tr("Go to Numbered Bookmark"));
++    gotoNumberedMenu.addToContainer(bookmarkMenuId);
++
++    for (int n = 1; n <= 9; ++n) {
++        ActionBuilder setNumbered(this, Id("Bookmarks.SetNumbered.").withSuffix(n));
++        setNumbered.setContext(editorManagerContext);
++        setNumbered.setText(Tr::tr("Set Bookmark %1").arg(n));
++        setNumbered.setDefaultKeySequence(QString("Meta+Shift+%1").arg(n),
++                                          QString("Ctrl+Shift+%1").arg(n));
++        setNumbered.addToContainer(setNumberedMenuId);
++        setNumbered.addOnTriggered(this, [this, n] {
++            IEditor *editor = EditorManager::currentEditor();
++            auto widget = TextEditorWidget::fromEditor(editor);
++            if (widget && editor && !editor->document()->isTemporary())
++                setNumberedBookmark(n, editor->document()->filePath(), editor->currentLine());
++        });
++
++        ActionBuilder gotoNumbered(this, Id("Bookmarks.GotoNumbered.").withSuffix(n));
++        // Global context: works from any mode, opens the file if needed
++        gotoNumbered.setText(Tr::tr("Go to Bookmark %1").arg(n));
++        gotoNumbered.setDefaultKeySequence(QString("Meta+%1").arg(n), QString("Ctrl+%1").arg(n));
++        gotoNumbered.addToContainer(gotoNumberedMenuId);
++        gotoNumbered.addOnTriggered(this, [this, n] { gotoNumberedBookmark(n); });
++    }
++
+     ActionContainer *touchBar = ActionManager::actionContainer(Core::Constants::TOUCH_BAR);
+     touchBar->addAction(toggleAction.command(), Core::Constants::G_TOUCHBAR_EDITOR);
+ 
+@@ -496,8 +531,11 @@
+         return QVariant();
+ 
+     Bookmark *bookMark = m_bookmarksList.at(index.row());
+-    if (role == BookmarkManager::Filename)
++    if (role == BookmarkManager::Filename) {
++        if (bookMark->number() >= 0)
++            return QString("[%1] %2").arg(bookMark->number()).arg(bookMark->filePath().fileName());
+         return bookMark->filePath().fileName();
++    }
+     if (role == BookmarkManager::LineNumber)
+         return bookMark->lineNumber();
+     if (role == BookmarkManager::Directory)
+@@ -939,6 +977,66 @@
+                                 Utils::equal(&Bookmark::lineNumber, lineNumber));
+ }
+ 
++Bookmark *BookmarkManager::numberedBookmark(int number) const
++{
++    return Utils::findOrDefault(m_bookmarksList, Utils::equal(&Bookmark::number, number));
++}
++
++// Takes the number away from a bookmark. A bookmark that only existed because
++// of its number (no note) is removed completely.
++void BookmarkManager::releaseNumber(Bookmark *bookmark)
++{
++    if (bookmark->note().isEmpty()) {
++        deleteBookmark(bookmark);
++    } else {
++        bookmark->setNumber(-1);
++        updateBookmark(bookmark);
++    }
++}
++
++void BookmarkManager::setNumberedBookmark(int number, const FilePath &filePath, int lineNumber)
++{
++    if (lineNumber <= 0 || filePath.isEmpty())
++        return;
++
++    Bookmark *here = findBookmark(filePath, lineNumber);
++    Bookmark *withNumber = numberedBookmark(number);
++
++    // Same number on the same line again: toggle it off
++    if (here && here == withNumber) {
++        releaseNumber(here);
++        return;
++    }
++
++    // The number moves here from wherever it was before
++    if (withNumber)
++        releaseNumber(withNumber);
++
++    if (!here) {
++        toggleBookmark(filePath, lineNumber);
++        here = findBookmark(filePath, lineNumber);
++        QTC_ASSERT(here, return);
++    }
++    here->setNumber(number); // replaces a different number the bookmark may have had
++    updateBookmark(here);
++    updateActionStatus();
++}
++
++void BookmarkManager::gotoNumberedBookmark(int number)
++{
++    Bookmark *bookmark = numberedBookmark(number);
++    if (!bookmark)
++        return;
++    if (gotoBookmark(bookmark)) {
++        const int row = m_bookmarksList.indexOf(bookmark);
++        if (row >= 0) {
++            selectionModel()->setCurrentIndex(index(row, 0, QModelIndex()),
++                                              QItemSelectionModel::Select
++                                                  | QItemSelectionModel::Clear);
++        }
++    }
++}
++
+ void BookmarkManager::insertBookmark(int idx, Bookmark *bookmark, bool userset)
+ {
+     idx = qBound(0, idx, m_bookmarksList.size());
+@@ -979,10 +1077,15 @@
+         const QString &filePath = s.mid(index1+1, index2-index1-1);
+         const QString &note = s.mid(index3 + 1);
+         const int lineNumber = s.mid(index2 + 1, index3 - index2 - 1).toInt();
++        // Optional bookmark number in front of the first colon ("3:/path:12\tnote")
++        bool hasNumber = false;
++        const int number = index1 > 0 ? s.left(index1).toInt(&hasNumber) : -1;
+         if (!filePath.isEmpty() && !findBookmark(FilePath::fromString(filePath), lineNumber)) {
+             auto b = new Bookmark(lineNumber, this);
+             b->updateFilePath(FilePath::fromString(filePath));
+             b->setNote(note);
++            if (hasNumber && number >= 0 && number <= 9 && !numberedBookmark(number))
++                b->setNumber(number);
+             addBookmark(b, false);
+         }
+     } else {
+@@ -996,7 +1099,9 @@
+     const QLatin1Char colon(':');
+     // Using \t as delimiter because any another symbol can be a part of note.
+     const QLatin1Char noteDelimiter('\t');
+-    return colon + b->filePath().toUrlishString() +
++    // The number goes in front of the first colon; older versions ignore it there.
++    const QString numberPrefix = b->number() >= 0 ? QString::number(b->number()) : QString();
++    return numberPrefix + colon + b->filePath().toUrlishString() +
+             colon + QString::number(b->lineNumber()) +
+             noteDelimiter + b->note();
+ }
+--- a/src/plugins/texteditor/bookmarkmanager.h	2026-10-12 13:04:53.526184653 +0000
++++ b/src/plugins/texteditor/bookmarkmanager.h	2026-10-12 13:06:35.926425978 +0000
+@@ -78,6 +78,10 @@
+     void sortByFilenames();
+     bool gotoBookmark(const Bookmark *bookmark) const;
+ 
++    // Numbered bookmarks: each number 1..9 belongs to at most one bookmark
++    void setNumberedBookmark(int number, const Utils::FilePath &filePath, int lineNumber);
++    void gotoNumberedBookmark(int number);
++
+     void requestContextMenu(const Utils::FilePath &filePath, int lineNumber, QMenu *menu);
+ 
+ private:
+@@ -88,6 +92,8 @@
+     void documentPrevNext(bool next);
+ 
+     Bookmark *findBookmark(const Utils::FilePath &filePath, int lineNumber);
++    Bookmark *numberedBookmark(int number) const;
++    void releaseNumber(Bookmark *bookmark);
+     void insertBookmark(int index, Bookmark *bookmark, bool userset = true);
+     void addBookmark(Bookmark *bookmark, bool userset = true);
+     void addBookmark(const QString &s);

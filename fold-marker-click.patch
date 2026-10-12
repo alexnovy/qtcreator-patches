@@ -1,0 +1,18 @@
+--- a/src/plugins/texteditor/texteditor.cpp
++++ b/src/plugins/texteditor/texteditor.cpp
+@@ -7824,10 +7824,11 @@
+                 if (!cursor.block().next().isVisible()) {
+                     d->toggleBlockVisible(cursor.block());
+                     d->moveCursorVisible(false);
+-                } else if (d->foldBox().contains(e->pos())) {
+-                    cursor.setPosition(
+-                            document()->findBlockByNumber(d->m_highlightBlocksInfo.open.last()).position()
+-                            );
++                } else if (TextBlockUserData::foldingIndent(cursor.block())
++                           < TextBlockUserData::foldingIndent(cursor.block().next())) {
++                    // Only fold when clicking on a line that shows a folding marker
++                    // (same condition as in paintCodeFolding()), not anywhere in the
++                    // highlighted range of the block.
+                     QTextBlock c = cursor.block();
+                     d->toggleBlockVisible(c);
+                     d->moveCursorVisible(false);

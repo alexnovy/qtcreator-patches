@@ -1,0 +1,530 @@
+--- a/src/plugins/coreplugin/outputpanemanager.h
++++ b/src/plugins/coreplugin/outputpanemanager.h
+@@ -75,6 +75,12 @@
+     void readSettings();
+     void updateActions(IOutputPane *pane);
+ 
++    // Detachable output panes
++    void detachPane(int idx);
++    void reattachPane(IOutputPane *pane);
++    void showDetachedPane(int idx, bool withFocus);
++    void saveDetachedState() const;
++
+     QLabel *m_titleLabel = nullptr;
+     OutputPaneManageButton *m_manageButton = nullptr;
+ 
+@@ -83,12 +89,14 @@
+     QAction *m_minMaxAction = nullptr;
+     QAction *m_nextAction = nullptr;
+     QAction *m_prevAction = nullptr;
++    QAction *m_detachAction = nullptr;
+ 
+     QStackedWidget *m_outputWidgetPane = nullptr;
+     QStackedWidget *m_opToolBarWidgets = nullptr;
+     QWidget *m_buttonsWidget = nullptr;
+     int m_outputPaneHeightSetting = 0;
+     bool m_initialized = false;
++    bool m_shuttingDown = false;
+ };
+ 
+ } // namespace Internal
+--- a/src/plugins/coreplugin/outputpanemanager.cpp
++++ b/src/plugins/coreplugin/outputpanemanager.cpp
+@@ -29,6 +29,8 @@
+ 
+ #include <QAction>
+ #include <QApplication>
++#include <QBoxLayout>
++#include <QCloseEvent>
+ #include <QComboBox>
+ #include <QDebug>
+ #include <QFocusEvent>
+@@ -36,6 +38,8 @@
+ #include <QLayout>
+ #include <QMenu>
+ #include <QPainter>
++#include <QPointer>
++#include <QPushButton>
+ #include <QSplitter>
+ #include <QStackedWidget>
+ #include <QStyle>
+@@ -43,6 +47,8 @@
+ #include <QToolBar>
+ #include <QToolButton>
+ 
++#include <functional>
++
+ using namespace Utils;
+ using namespace Core::Internal;
+ 
+@@ -307,6 +313,36 @@
+     return Utils::anyOf(*sPlaceholders, Utils::equal(&OutputPanePlaceHolder::mode, mode));
+ }
+ 
++namespace Internal {
++
++// Top-level window that hosts a detached output pane.
++// Closing it puts the pane back into the bottom output panel.
++class DetachedOutputPaneWindow : public QWidget
++{
++public:
++    DetachedOutputPaneWindow()
++        : QWidget(nullptr, Qt::Window)
++    {
++        setAttribute(Qt::WA_DeleteOnClose);
++        setAttribute(Qt::WA_QuitOnClose, false);
++    }
++
++    std::function<void()> onClose;
++
++protected:
++    void closeEvent(QCloseEvent *e) override
++    {
++        if (onClose) {
++            const std::function<void()> f = std::move(onClose);
++            onClose = {};
++            f();
++        }
++        QWidget::closeEvent(e);
++    }
++};
++
++} // namespace Internal
++
+ class OutputPaneData
+ {
+ public:
+@@ -316,6 +352,17 @@
+     Id id;
+     OutputPaneToggleButton *button = nullptr;
+     QAction *action = nullptr;
++
++    // Page in the output panel's stacked widget. Holds either the pane's widget
++    // or, while detached, a placeholder. Same for the pane's tool bar.
++    QWidget *pageHolder = nullptr;
++    QWidget *toolBarHolder = nullptr;
++    QPointer<QWidget> paneWidget;
++    QPointer<QToolBar> toolBar;
++    QWidget *detachedPlaceholder = nullptr;
++    QPointer<Internal::DetachedOutputPaneWindow> window;
++    QByteArray detachedGeometry;
++    bool restoreDetached = false;
+ };
+ 
+ static QVector<OutputPaneData> g_outputPanes;
+@@ -347,6 +394,8 @@
+ {
+     const int i = Utils::indexOf(g_outputPanes, Utils::equal(&OutputPaneData::pane, this));
+     QTC_ASSERT(i >= 0, return);
++    if (g_outputPanes.at(i).window)
++        g_outputPanes.at(i).window->close(); // re-attaches the widgets
+     delete g_outputPanes.at(i).button;
+     g_outputPanes.removeAt(i);
+ 
+@@ -602,6 +651,13 @@
+ const char outputPaneSettingsKeyC[] = "OutputPaneVisibility";
+ const char outputPaneIdKeyC[] = "id";
+ const char outputPaneVisibleKeyC[] = "visible";
++const char outputPaneDetachedKeyC[] = "OutputPaneDetached";
++const char outputPaneGeometryKeyC[] = "geometry";
++
++static int indexOfPane(IOutputPane *pane)
++{
++    return Utils::indexOf(g_outputPanes, Utils::equal(&OutputPaneData::pane, pane));
++}
+ const int buttonBorderWidth = 3;
+ 
+ static int numberAreaWidth()
+@@ -640,7 +696,8 @@
+     const OutputPaneData &data = g_outputPanes.at(idx);
+     QTC_ASSERT(data.button, return);
+     data.button->setChecked(visible);
+-    data.pane->visibilityChanged(visible);
++    if (!data.window)
++        data.pane->visibilityChanged(visible);
+ }
+ 
+ void OutputPaneManager::updateMaximizeButton(bool maximized)
+@@ -683,6 +740,7 @@
+     auto clearButton = new QToolButton;
+     auto prevToolButton = new QToolButton;
+     auto nextToolButton = new QToolButton;
++    auto detachButton = new QToolButton;
+     auto minMaxButton = new QToolButton;
+     auto closeButton = new QToolButton;
+ 
+@@ -697,6 +755,7 @@
+         prevToolButton,
+         nextToolButton,
+         m_opToolBarWidgets,
++        detachButton,
+         minMaxButton,
+         closeButton,
+         spacing(0), noMargin,
+@@ -754,6 +813,30 @@
+         .bindContextAction(&m_nextAction);
+     nextToolButton->setDefaultAction(nextAction.contextAction());
+ 
++    ActionBuilder detachAction(this, "Coreplugin.OutputPane.detach");
++    detachAction
++        .setIcon(QApplication::style()->standardIcon(QStyle::SP_TitleBarNormalButton))
++        .setText(Tr::tr("Open in Separate Window"))
++        .addOnTriggered(this, [this] {
++            const int idx = currentIndex();
++            if (idx >= 0)
++                detachPane(idx);
++        })
++        .addToContainer(Constants::M_VIEW_PANES, "Coreplugin.OutputPane.ActionsGroup")
++        .bindContextAction(&m_detachAction);
++    detachButton->setDefaultAction(detachAction.contextAction());
++
++    // Put detached panes back before plugins shut down, so that pane widgets
++    // are never owned by a window that outlives them (or vice versa).
++    connect(ICore::instance(), &ICore::coreAboutToClose, this, [this] {
++        saveDetachedState();
++        m_shuttingDown = true;
++        for (OutputPaneData &data : g_outputPanes) {
++            if (data.window)
++                data.window->close();
++        }
++    });
++
+     ActionBuilder minMaxAction(this, "Coreplugin.OutputPane.minmax");
+     minMaxAction
+         .setDefaultKeySequence(Tr::tr("Ctrl+Shift+9"), Tr::tr("Alt+Shift+9"))
+@@ -793,6 +876,15 @@
+ 
+     m_instance->readSettings();
+ 
++    connect(ICore::instance(), &ICore::coreOpened, m_instance, [] {
++        for (int i = 0; i < g_outputPanes.size(); ++i) {
++            if (g_outputPanes.at(i).restoreDetached) {
++                g_outputPanes[i].restoreDetached = false;
++                m_instance->detachPane(i);
++            }
++        }
++    });
++
+     connect(ModeManager::instance(), &ModeManager::currentModeChanged, m_instance, [] {
+         const int index = m_instance->currentIndex();
+         m_instance->updateActions(index >= 0 ? g_outputPanes.at(index).pane : nullptr);
+@@ -820,9 +912,18 @@
+         OutputPaneData &data = g_outputPanes[i];
+         IOutputPane *outPane = data.pane;
+         QWidget *widget = outPane->outputWidget(m_instance);
+-        int idx = m_instance->m_outputWidgetPane->indexOf(widget);
++        if (!data.pageHolder) {
++            data.paneWidget = widget;
++            data.pageHolder = new QWidget;
++            auto pageLayout = new QVBoxLayout(data.pageHolder);
++            pageLayout->setContentsMargins(0, 0, 0, 0);
++            pageLayout->setSpacing(0);
++            pageLayout->addWidget(widget);
++            data.pageHolder->setFocusProxy(widget);
++        }
++        int idx = m_instance->m_outputWidgetPane->indexOf(data.pageHolder);
+         if (idx < 0) {
+-            idx = m_instance->m_outputWidgetPane->insertWidget(i, widget);
++            idx = m_instance->m_outputWidgetPane->insertWidget(i, data.pageHolder);
+ 
+             connect(outPane, &IOutputPane::showPage, m_instance, [idx](int flags) {
+                 m_instance->showPage(idx, flags);
+@@ -841,7 +942,7 @@
+                     m_instance->updateActions(outPane);
+             });
+ 
+-            auto *toolBar = new QToolBar(m_instance->m_opToolBarWidgets);
++            auto *toolBar = new QToolBar;
+             toolBar->setContentsMargins(0, 0, 0, 0);
+             const QList<QWidget *> toolBarWidgets = outPane->toolBarWidgets();
+             for (QWidget *toolButton : toolBarWidgets)
+@@ -850,7 +951,14 @@
+             stretch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
+             toolBar->addWidget(stretch);
+ 
+-            m_instance->m_opToolBarWidgets->insertWidget(i, toolBar);
++            data.toolBar = toolBar;
++            data.toolBarHolder = new QWidget;
++            auto toolBarLayout = new QHBoxLayout(data.toolBarHolder);
++            toolBarLayout->setContentsMargins(0, 0, 0, 0);
++            toolBarLayout->setSpacing(0);
++            toolBarLayout->addWidget(toolBar);
++
++            m_instance->m_opToolBarWidgets->insertWidget(i, data.toolBarHolder);
+         }
+         QTC_CHECK(idx == i);
+ 
+@@ -902,6 +1010,10 @@
+ 
+ void OutputPaneManager::shortcutTriggered(int idx)
+ {
++    if (g_outputPanes.at(idx).window) {
++        showDetachedPane(idx, true);
++        return;
++    }
+     IOutputPane *outputPane = g_outputPanes.at(idx).pane;
+     // Now check the special case, the output window is already visible,
+     // we are already on that page but the outputpane doesn't have focus
+@@ -949,6 +1061,10 @@
+ void OutputPaneManager::buttonTriggered(int idx)
+ {
+     QTC_ASSERT(idx >= 0, return);
++    if (g_outputPanes.at(idx).window) {
++        showDetachedPane(idx, true);
++        return;
++    }
+     if (idx == currentIndex() && OutputPanePlaceHolder::isCurrentVisible()) {
+         // we should toggle and the page is already visible and we are actually closeable
+         slotHide();
+@@ -972,6 +1088,18 @@
+     }
+     settings->endArray();
+ 
++    const int detachedCount = settings->beginReadArray(outputPaneDetachedKeyC);
++    for (int i = 0; i < detachedCount; ++i) {
++        settings->setArrayIndex(i);
++        const Id id = Id::fromSetting(settings->value(outputPaneIdKeyC));
++        const int idx = Utils::indexOf(g_outputPanes, Utils::equal(&OutputPaneData::id, id));
++        if (idx < 0)
++            continue;
++        g_outputPanes[idx].detachedGeometry = settings->value(outputPaneGeometryKeyC).toByteArray();
++        g_outputPanes[idx].restoreDetached = true;
++    }
++    settings->endArray();
++
+     m_outputPaneHeightSetting
+         = settings->value("OutputPanePlaceHolder/Height", 0).toInt();
+     const int currentIdx
+@@ -1020,7 +1148,8 @@
+         int idx = currentIndex();
+         QTC_ASSERT(idx >= 0, return);
+         g_outputPanes.at(idx).button->setChecked(false);
+-        g_outputPanes.at(idx).pane->visibilityChanged(false);
++        if (!g_outputPanes.at(idx).window)
++            g_outputPanes.at(idx).pane->visibilityChanged(false);
+         if (IEditor *editor = EditorManager::currentEditor()) {
+             QWidget *w = editor->widget()->focusWidget();
+             if (!w)
+@@ -1041,6 +1170,10 @@
+ void OutputPaneManager::showPage(int idx, int flags)
+ {
+     QTC_ASSERT(idx >= 0, return);
++    if (g_outputPanes.at(idx).window) {
++        showDetachedPane(idx, flags & IOutputPane::WithFocus);
++        return;
++    }
+     OutputPanePlaceHolder *ph = OutputPanePlaceHolder::getCurrent();
+ 
+     if (!ph && flags & IOutputPane::ModeSwitch) {
+@@ -1091,7 +1224,8 @@
+ 
+     if (lastIndex != -1) {
+         g_outputPanes.at(lastIndex).button->setChecked(false);
+-        g_outputPanes.at(lastIndex).pane->visibilityChanged(false);
++        if (!g_outputPanes.at(lastIndex).window)
++            g_outputPanes.at(lastIndex).pane->visibilityChanged(false);
+     }
+ 
+     if (idx != -1) {
+@@ -1122,7 +1256,8 @@
+         act->setChecked(data.button->isPaneVisible());
+         connect(act, &QAction::triggered, this, [this, data, idx] {
+             if (data.button->isPaneVisible()) {
+-                data.pane->visibilityChanged(false);
++                if (!data.window)
++                    data.pane->visibilityChanged(false);
+                 data.button->setChecked(false);
+                 data.button->hide();
+             } else {
+@@ -1171,6 +1306,191 @@
+         heightSetting = curr->nonMaximizedSize();
+     settings->setValue("OutputPanePlaceHolder/Height", heightSetting);
+     settings->setValue("OutputPanePlaceHolder/CurrentIndex", currentIndex());
++    // During shutdown the state was saved before the windows were closed.
++    if (!m_shuttingDown)
++        saveDetachedState();
++}
++
++void OutputPaneManager::saveDetachedState() const
++{
++    QtcSettings *settings = ICore::settings();
++    QList<const OutputPaneData *> detached;
++    for (const OutputPaneData &data : std::as_const(g_outputPanes)) {
++        if (data.window)
++            detached.append(&data);
++    }
++    settings->beginWriteArray(outputPaneDetachedKeyC, detached.size());
++    for (int i = 0; i < detached.size(); ++i) {
++        settings->setArrayIndex(i);
++        settings->setValue(outputPaneIdKeyC, detached.at(i)->id.toSetting());
++        settings->setValue(outputPaneGeometryKeyC, detached.at(i)->window->saveGeometry());
++    }
++    settings->endArray();
++}
++
++void OutputPaneManager::detachPane(int idx)
++{
++    QTC_ASSERT(idx >= 0 && idx < g_outputPanes.size(), return);
++    OutputPaneData &data = g_outputPanes[idx];
++    if (data.window) {
++        showDetachedPane(idx, true);
++        return;
++    }
++    QTC_ASSERT(data.paneWidget && data.toolBar && data.pageHolder, return);
++    IOutputPane *pane = data.pane;
++    const bool wasShownInPanel = currentIndex() == idx
++                                 && OutputPanePlaceHolder::isCurrentVisible();
++
++    auto window = new DetachedOutputPaneWindow;
++    window->setWindowTitle(Tr::tr("%1 - Qt Creator").arg(pane->displayName()));
++
++    // Tool bar: clear, previous/next item, the pane's own tool bar, re-attach
++    auto bar = new StyledBar;
++    auto clearButton = new QToolButton;
++    clearButton->setIcon(Utils::Icons::CLEAN_TOOLBAR.icon());
++    clearButton->setToolTip(Tr::tr("Clear"));
++    auto prevButton = new QToolButton;
++    prevButton->setIcon(Utils::Icons::ARROW_UP_TOOLBAR.icon());
++    prevButton->setToolTip(Tr::tr("Previous Item"));
++    auto nextButton = new QToolButton;
++    nextButton->setIcon(Utils::Icons::ARROW_DOWN_TOOLBAR.icon());
++    nextButton->setToolTip(Tr::tr("Next Item"));
++    auto attachButton = new QToolButton;
++    attachButton->setIcon(Icons::CLOSE_SPLIT_BOTTOM.icon());
++    attachButton->setToolTip(Tr::tr("Move Back to Output Panel"));
++
++    auto barLayout = new QHBoxLayout(bar);
++    barLayout->setContentsMargins(0, 0, 0, 0);
++    barLayout->setSpacing(0);
++    barLayout->addWidget(clearButton);
++    barLayout->addWidget(prevButton);
++    barLayout->addWidget(nextButton);
++    barLayout->addWidget(data.toolBar, 1); // reparents the pane's tool bar
++    barLayout->addWidget(attachButton);
++    data.toolBar->show();
++
++    connect(clearButton, &QToolButton::clicked, pane, [pane] { pane->clearContents(); });
++    connect(prevButton, &QToolButton::clicked, pane, [pane] {
++        if (pane->canNavigate() && pane->canPrevious())
++            pane->goToPrev();
++    });
++    connect(nextButton, &QToolButton::clicked, pane, [pane] {
++        if (pane->canNavigate() && pane->canNext())
++            pane->goToNext();
++    });
++    const auto updateNavigation = [pane, prevButton, nextButton] {
++        prevButton->setEnabled(pane->canNavigate() && pane->canPrevious());
++        nextButton->setEnabled(pane->canNavigate() && pane->canNext());
++    };
++    connect(pane, &IOutputPane::navigateStateUpdate, window, updateNavigation);
++    updateNavigation();
++    connect(attachButton, &QToolButton::clicked, window, &QWidget::close);
++
++    auto windowLayout = new QVBoxLayout(window);
++    windowLayout->setContentsMargins(0, 0, 0, 0);
++    windowLayout->setSpacing(0);
++    windowLayout->addWidget(bar);
++    windowLayout->addWidget(data.paneWidget, 1); // reparents the pane's widget
++    windowLayout->addWidget(new FindToolBarPlaceHolder(window));
++    data.paneWidget->show();
++    window->setFocusProxy(data.paneWidget);
++
++    // Placeholder shown in the output panel while the pane is detached
++    if (!data.detachedPlaceholder) {
++        auto placeholder = new QWidget;
++        auto label = new QLabel(Tr::tr("%1 is shown in a separate window.")
++                                    .arg(pane->displayName()));
++        label->setAlignment(Qt::AlignCenter);
++        auto showButton = new QPushButton(Tr::tr("Show Window"));
++        auto backButton = new QPushButton(Tr::tr("Move Back Here"));
++        connect(showButton, &QPushButton::clicked, this, [this, pane] {
++            const int i = indexOfPane(pane);
++            if (i >= 0)
++                showDetachedPane(i, true);
++        });
++        connect(backButton, &QPushButton::clicked, this, [pane] {
++            const int i = indexOfPane(pane);
++            if (i >= 0 && g_outputPanes.at(i).window)
++                g_outputPanes.at(i).window->close();
++        });
++        auto buttons = new QHBoxLayout;
++        buttons->addStretch();
++        buttons->addWidget(showButton);
++        buttons->addWidget(backButton);
++        buttons->addStretch();
++        auto placeholderLayout = new QVBoxLayout(placeholder);
++        placeholderLayout->addStretch();
++        placeholderLayout->addWidget(label);
++        placeholderLayout->addLayout(buttons);
++        placeholderLayout->addStretch();
++        data.pageHolder->layout()->addWidget(placeholder);
++        data.detachedPlaceholder = placeholder;
++    }
++    data.detachedPlaceholder->show();
++    data.pageHolder->setFocusProxy(nullptr);
++
++    window->onClose = [this, pane] { reattachPane(pane); };
++    data.window = window;
++
++    if (data.detachedGeometry.isEmpty() || !window->restoreGeometry(data.detachedGeometry))
++        window->resize(900, 450);
++    window->show();
++    pane->visibilityChanged(true);
++
++    if (wasShownInPanel)
++        slotHide();
++}
++
++void OutputPaneManager::reattachPane(IOutputPane *pane)
++{
++    const int idx = indexOfPane(pane);
++    QTC_ASSERT(idx >= 0, return);
++    OutputPaneData &data = g_outputPanes[idx];
++    if (!data.window)
++        return;
++
++    data.detachedGeometry = data.window->saveGeometry();
++    data.window->setFocusProxy(nullptr);
++
++    if (data.toolBar) {
++        data.toolBarHolder->layout()->addWidget(data.toolBar);
++        data.toolBar->show();
++    }
++    if (data.detachedPlaceholder)
++        data.detachedPlaceholder->hide();
++    if (data.paneWidget) {
++        data.pageHolder->layout()->addWidget(data.paneWidget);
++        data.paneWidget->show();
++        data.pageHolder->setFocusProxy(data.paneWidget);
++    }
++    data.window = nullptr; // the window deletes itself (WA_DeleteOnClose)
++
++    if (!m_shuttingDown) {
++        const bool visibleInPanel = currentIndex() == idx
++                                    && OutputPanePlaceHolder::isCurrentVisible();
++        pane->visibilityChanged(visibleInPanel);
++        if (data.button)
++            data.button->setChecked(visibleInPanel);
++    }
++}
++
++void OutputPaneManager::showDetachedPane(int idx, bool withFocus)
++{
++    QTC_ASSERT(idx >= 0 && idx < g_outputPanes.size(), return);
++    const OutputPaneData &data = g_outputPanes.at(idx);
++    QTC_ASSERT(data.window, return);
++    DetachedOutputPaneWindow *window = data.window;
++    if (window->isMinimized())
++        window->showNormal();
++    else
++        window->show();
++    if (withFocus) {
++        ICore::raiseWindow(window);
++        if (data.pane->canFocus())
++            data.pane->setFocus();
++    } else {
++        window->raise(); // don't steal focus, e.g. when starting an application
++    }
+ }
+ 
+ void OutputPaneManager::clearPage()
