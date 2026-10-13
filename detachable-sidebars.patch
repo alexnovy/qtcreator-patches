@@ -1,0 +1,359 @@
+--- a/src/plugins/coreplugin/navigationsubwidget.cpp	2026-10-13 12:07:26.360036772 +0000
++++ b/src/plugins/coreplugin/navigationsubwidget.cpp	2026-10-13 12:09:02.075944681 +0000
+@@ -14,8 +14,10 @@
+ #include <utils/stylehelper.h>
+ #include <utils/utilsicons.h>
+ 
++#include <QApplication>
+ #include <QHBoxLayout>
+ #include <QMenu>
++#include <QStyle>
+ #include <QToolButton>
+ 
+ using namespace Utils;
+@@ -75,7 +77,22 @@
+     m_closeButton->setIcon(Utils::Icons::CLOSE_SPLIT_BOTTOM.icon());
+     m_closeButton->setToolTip(Tr::tr("Close"));
+ 
++    auto detachButton = new QToolButton();
++    detachButton->setIcon(QApplication::style()->standardIcon(QStyle::SP_TitleBarNormalButton));
++    detachButton->setCheckable(true);
++    const auto updateDetachButton = [detachButton](bool detached) {
++        detachButton->setChecked(detached);
++        detachButton->setToolTip(detached ? Tr::tr("Move Sidebar Back into Main Window")
++                                          : Tr::tr("Open Sidebar in Separate Window"));
++    };
++    updateDetachButton(parentWidget->isDetached());
++    connect(detachButton, &QToolButton::clicked, this, [this] {
++        m_parentWidget->setDetached(!m_parentWidget->isDetached());
++    });
++    connect(parentWidget, &NavigationWidget::detachedChanged, detachButton, updateDetachButton);
++
+     toolBarLayout->addWidget(splitAction);
++    toolBarLayout->addWidget(detachButton);
+     toolBarLayout->addWidget(m_closeButton);
+ 
+     auto lay = new QVBoxLayout();
+@@ -123,7 +140,7 @@
+     m_additionalToolBarWidgets = n.dockToolBarWidgets;
+     auto layout = qobject_cast<QHBoxLayout *>(m_toolBar->layout());
+     for (QToolButton *w : std::as_const(m_additionalToolBarWidgets))
+-        layout->insertWidget(layout->count()-2, w);
++        layout->insertWidget(layout->count()-3, w);
+ 
+     restoreSettings();
+     emit factoryIndexChanged(factoryIndex);
+--- a/src/plugins/coreplugin/navigationwidget.cpp	2026-10-13 12:07:26.359964856 +0000
++++ b/src/plugins/coreplugin/navigationwidget.cpp	2026-10-13 12:09:02.075620830 +0000
+@@ -20,12 +20,19 @@
+ #include <aggregation/aggregate.h>
+ 
+ #include <QAction>
++#include <QApplication>
++#include <QCloseEvent>
+ #include <QCoreApplication>
+ #include <QDebug>
+ #include <QDockWidget>
+ #include <QHBoxLayout>
++#include <QPointer>
+ #include <QResizeEvent>
+ #include <QStandardItemModel>
++#include <QTimer>
++#include <QVBoxLayout>
++
++#include <functional>
+ 
+ using namespace Utils;
+ 
+@@ -37,6 +44,36 @@
+ };
+ using ActivationsMap = QHash<Id, ActivationInfo>;
+ 
++// Top-level window hosting a detached sidebar. Closing it re-attaches the sidebar.
++class SidebarWindow final : public QWidget
++{
++public:
++    SidebarWindow()
++        : QWidget(nullptr, Qt::Window)
++    {
++        setAttribute(Qt::WA_DeleteOnClose);
++        setAttribute(Qt::WA_QuitOnClose, false);
++        auto layout = new QVBoxLayout(this);
++        layout->setContentsMargins(0, 0, 0, 0);
++        layout->setSpacing(0);
++    }
++
++    std::function<void()> onClose;
++    bool isClosing = false;
++
++protected:
++    void closeEvent(QCloseEvent *e) override
++    {
++        isClosing = true;
++        if (onClose) {
++            const std::function<void()> f = std::move(onClose);
++            onClose = {};
++            f();
++        }
++        QWidget::closeEvent(e);
++    }
++};
++
+ static NavigationWidget *s_instanceLeft = nullptr;
+ static NavigationWidget *s_instanceRight = nullptr;
+ static ActivationsMap s_activationsMap = {};
+@@ -79,7 +116,7 @@
+ NavigationWidgetPlaceHolder::~NavigationWidgetPlaceHolder()
+ {
+     if (NavigationWidgetPlaceHolder::current(m_side) == this) {
+-        if (NavigationWidget *nw = instance(m_side)) {
++        if (NavigationWidget *nw = instance(m_side); nw && !nw->isDetached()) {
+             nw->setParent(nullptr);
+             nw->hide();
+         }
+@@ -129,19 +166,26 @@
+ 
+     if (current == this) {
+         setCurrent(m_side, nullptr);
+-        navigationWidget->setParent(nullptr);
+-        navigationWidget->hide();
++        if (!navigationWidget->isDetached()) {
++            navigationWidget->setParent(nullptr);
++            navigationWidget->hide();
++        }
+         navigationWidget->placeHolderChanged();
+     }
+ 
+     if (m_mode == mode) {
+         setCurrent(m_side, this);
+ 
+-        layout()->addWidget(navigationWidget);
+-        navigationWidget->show();
++        if (navigationWidget->isDetached()) {
++            // The sidebar lives in its own window, keep the place holder empty
++            setVisible(false);
++        } else {
++            layout()->addWidget(navigationWidget);
++            navigationWidget->show();
+ 
+-        applyStoredSize();
+-        setVisible(navigationWidget->isShown());
++            applyStoredSize();
++            setVisible(navigationWidget->isShown());
++        }
+         navigationWidget->placeHolderChanged();
+     }
+ }
+@@ -166,6 +210,10 @@
+     int m_width;
+     QAction *m_toggleSideBarAction; // does not take ownership
+     Side m_side;
++
++    bool m_detached = false;
++    QPointer<SidebarWindow> m_window;
++    QByteArray m_windowGeometry;
+ };
+ 
+ NavigationWidgetPrivate::NavigationWidgetPrivate(QAction *toggleSideBarAction, Side side) :
+@@ -196,6 +244,10 @@
+ 
+ NavigationWidget::~NavigationWidget()
+ {
++    if (d->m_window) {
++        d->m_window->onClose = {};
++        d->m_window->deleteLater();
++    }
+     if (d->m_side == Side::Left)
+         s_instanceLeft = nullptr;
+     else
+@@ -298,7 +350,8 @@
+ 
+ void NavigationWidget::resizeEvent(QResizeEvent *re)
+ {
+-    if (d->m_width && re->size().width())
++    // The width of the detached window must not change the docked width
++    if (!d->m_detached && d->m_width && re->size().width())
+         d->m_width = re->size().width();
+     MiniSplitter::resizeEvent(re);
+ }
+@@ -405,6 +458,8 @@
+ 
+ bool NavigationWidget::toggleActionEnabled() const
+ {
++    if (d->m_detached)
++        return true;
+     const bool haveData = d->m_factoryModel->rowCount();
+     if (haveData && NavigationWidgetPlaceHolder::current(d->m_side))
+         return true;
+@@ -415,6 +470,8 @@
+ 
+ bool NavigationWidget::toggleActionChecked() const
+ {
++    if (d->m_detached)
++        return d->m_shown;
+     const bool haveData = d->m_factoryModel->rowCount();
+     if (haveData && NavigationWidgetPlaceHolder::current(d->m_side))
+         return d->m_shown;
+@@ -444,6 +501,10 @@
+     settings->setValueWithDefault(settingsKey("Visible"), isShown(), defaultVisible(d->m_side));
+     settings->setValue(settingsKey("VerticalPosition"), saveState());
+     settings->setValue(settingsKey("Width"), d->m_width);
++    settings->setValueWithDefault(settingsKey("Detached"), d->m_detached, false);
++    const QByteArray geometry = d->m_window ? d->m_window->saveGeometry() : d->m_windowGeometry;
++    if (!geometry.isEmpty())
++        settings->setValue(settingsKey("DetachedGeometry"), geometry);
+ 
+     const Key activationKey = "ActivationPosition.";
+     for (auto it = s_activationsMap.cbegin(); it != s_activationsMap.cend(); ++it) {
+@@ -514,6 +575,17 @@
+     if (d->m_width < 40)
+         d->m_width = 40;
+ 
++    d->m_windowGeometry = settings->value(settingsKey("DetachedGeometry")).toByteArray();
++    if (settings->value(settingsKey("Detached"), false).toBool()) {
++        // Detach once startup is finished
++        QTimer::singleShot(0, this, [this] {
++            const bool shown = d->m_shown;
++            setDetached(true);
++            if (!shown)
++                setShown(false);
++        });
++    }
++
+     // Apply
+     if (NavigationWidgetPlaceHolder::current(d->m_side))
+         NavigationWidgetPlaceHolder::current(d->m_side)->applyStoredSize();
+@@ -544,6 +616,23 @@
+ 
+ void NavigationWidget::setShown(bool b)
+ {
++    if (d->m_detached) {
++        d->m_shown = b;
++        if (d->m_window) {
++            if (b) {
++                if (d->m_window->isMinimized())
++                    d->m_window->showNormal();
++                else
++                    d->m_window->show();
++                d->m_window->raise();
++            } else {
++                d->m_window->hide();
++            }
++        }
++        updateToggleAction();
++        return;
++    }
++
+     NavigationWidgetPlaceHolder *current = NavigationWidgetPlaceHolder::current(d->m_side);
+     if (!current && d->m_mainWindow) {
+         // mode without placeholder but with main window
+@@ -567,6 +656,73 @@
+     return d->m_shown;
+ }
+ 
++bool NavigationWidget::isDetached() const
++{
++    return d->m_detached;
++}
++
++void NavigationWidget::setDetached(bool detached)
++{
++    if (d->m_detached == detached) {
++        if (detached)
++            setShown(true);
++        return;
++    }
++
++    NavigationWidgetPlaceHolder *current = NavigationWidgetPlaceHolder::current(d->m_side);
++
++    if (detached) {
++        auto window = new SidebarWindow;
++        window->setWindowTitle(d->m_side == Side::Left ? Tr::tr("Left Sidebar - Qt Creator")
++                                                       : Tr::tr("Right Sidebar - Qt Creator"));
++        window->layout()->addWidget(this); // reparents the sidebar
++        show();
++        if (current)
++            current->setVisible(false);
++
++        d->m_detached = true;
++        d->m_shown = true;
++        d->m_window = window;
++        window->onClose = [this] { setDetached(false); };
++        // Keep the window out of the way while Qt Creator shuts down;
++        // the detached state is still saved.
++        if (ICore::instance()) {
++            connect(ICore::instance(), &ICore::coreAboutToClose, window, [window] {
++                window->onClose = {};
++                window->hide();
++            });
++        }
++
++        if (d->m_windowGeometry.isEmpty() || !window->restoreGeometry(d->m_windowGeometry))
++            window->resize(qMax(d->m_width, 300), 700);
++        window->show();
++    } else {
++        SidebarWindow *window = d->m_window;
++        d->m_detached = false;
++        d->m_window = nullptr;
++        if (window)
++            d->m_windowGeometry = window->saveGeometry();
++
++        if (current) {
++            current->layout()->addWidget(this);
++            show();
++            current->applyStoredSize();
++            current->setVisible(d->m_shown && d->m_factoryModel->rowCount());
++        } else {
++            setParent(nullptr);
++            hide();
++        }
++
++        if (window && !window->isClosing) {
++            window->onClose = {};
++            window->close(); // deletes itself
++        }
++    }
++
++    updateToggleAction();
++    emit detachedChanged(detached);
++}
++
+ int NavigationWidget::factoryIndex(Id id)
+ {
+     for (int row = 0; row < d->m_factoryModel->rowCount(); ++row) {
+--- a/src/plugins/coreplugin/navigationwidget.h	2026-10-13 12:07:26.360020506 +0000
++++ b/src/plugins/coreplugin/navigationwidget.h	2026-10-13 12:09:02.074957339 +0000
+@@ -80,6 +80,10 @@
+     bool isShown() const;
+     void setShown(bool b);
+ 
++    // Detached: shown in its own top-level window, independent of modes
++    bool isDetached() const;
++    void setDetached(bool detached);
++
+     static QWidget *activateSubWidget(Utils::Id factoryId, Side fallbackSide);
+ 
+     int storedWidth();
+@@ -90,6 +94,9 @@
+     QHash<Utils::Id, Command *> commandMap() const;
+     QAbstractItemModel *factoryModel() const;
+ 
++signals:
++    void detachedChanged(bool detached);
++
+ protected:
+     void resizeEvent(QResizeEvent *) override;
+ 
+--- a/src/plugins/debugger/debuggerplugin.cpp	2026-10-13 12:07:26.360151089 +0000
++++ b/src/plugins/debugger/debuggerplugin.cpp	2026-10-13 12:09:02.076544078 +0000
+@@ -489,8 +489,10 @@
+         setFocusProxy(PerspectivesView::centralWidgetStack());
+         addWidget(new NavigationWidgetPlaceHolder(MODE_DEBUG, Side::Left));
+         addWidget(mainWindowSplitter);
++        addWidget(new NavigationWidgetPlaceHolder(MODE_DEBUG, Side::Right));
+         setStretchFactor(0, 0);
+         setStretchFactor(1, 1);
++        setStretchFactor(2, 0);
+         setObjectName("DebugModeWidget");
+ 
+         PerspectivesView::addSubPerspectiveSwitcher(EngineManager::engineChooser());
